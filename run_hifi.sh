@@ -30,4 +30,6 @@ cat "$PIPE_PATH" | \
 
 #768000 means DSD512
 taskset -c 2,3 chrt -f 99 "$ENGINE_BIN" "$USER_GAIN" | \
-aplay -D hw:0,0 -c 2 -f DSD_U32_BE -r 768000 -q -B 100000 --period-size=25000 2>/dev/null
+#aplay -D hw:0,0 -c 2 -f DSD_U32_BE -r 768000 -q -B 100000 --period-size=25000 2>/dev/null
+
+aplay -D hw:0,0 -c 2 -f DSD_U32_BE -r 768000 -q -B 100000 2>/dev/null
