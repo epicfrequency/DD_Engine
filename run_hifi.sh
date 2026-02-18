@@ -1,5 +1,22 @@
 #!/bin/bash
 
+# MPD config
+
+# audio_output {
+#     type        "pipe"
+#     name        "DSD512_Upsampler"
+#     command     "cat > /tmp/mpd_dsd_pipe"
+#       format      "384000:f:2"
+#   # 这里固定 352.8k Float
+#     #mixer_type      "software"
+# }
+
+# resampler {
+#         plugin  "soxr"
+#         quality "very high"
+# }
+
+
 # 参数设置
 USER_GAIN=${1:-0.2} # 默认增益设置为 0.2，用户可通过命令行参数覆盖
 PIPE_PATH="/tmp/mpd_dsd_pipe"
