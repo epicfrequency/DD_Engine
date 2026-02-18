@@ -7,156 +7,128 @@
 #include <iomanip>
 #include <unistd.h>
 
-// 针对 ARM 缓存行对齐，减少 Pi 5 内存访问冲突
+// 🔬 调制器结构：包含层级监控
 struct alignas(64) SDM5 {
     double s[5] = {0,0,0,0,0};
-    double s_peak[5] = {0,0,0,0,0};
-    double s_scale[5] = {100.0, 100.0, 100.0, 100.0, 100.0}; 
-    uint64_t s_clips[5] = {0,0,0,0,0}; 
+    double s_peak[5] = {0,0,0,0,0};  // 记录 S0-S4 的峰值 📈
     double q = 0;
     const double LIMIT = 100.0;
-    double gain_factor = 0.8;
+    double gain_factor = 0.5;
     
     double max_stress_period = 0;
-    double global_stress_scale = 100.0; 
     uint64_t total_samples = 0;
     uint64_t total_clips = 0;
 
     void reset() {
-        for(int i=0; i<5; ++i) { 
-            s[i] = 0; s_peak[i] = 0; s_clips[i] = 0; 
-            s_scale[i] = 100.0; 
-        }
+        for(int i=0; i<5; ++i) { s[i]=0; s_peak[i]=0; }
         q = 0; total_samples = 0; total_clips = 0; max_stress_period = 0;
-        global_stress_scale = 100.0;
     }
 
-    // Pi 5 优化：手动内联和分支预测优化
-    inline int modulate(const double& input) {
+    inline int modulate(double input) {
         const double x = input * gain_factor;
         total_samples++;
         
-        // 5阶积分器核心 - 展开循环以利用 Pi 5 的流水线执行
+        // 5阶积分核心逻辑 
         s[0] += (x - q);
-        s[1] += (s[0] - q * 0.62);
-        s[2] += (s[1] - q * 0.16);
-        s[3] += (s[2] - q * 0.025);
-        s[4] += (s[3] - q * 0.0015);
+        s[1] += (s[0] - q * 0.5);
+        s[2] += (s[1] - q * 0.25);
+        s[3] += (s[2] - q * 0.125);
+        s[4] += (s[3] - q * 0.0625);
 
-        bool clipped = false;
-        // 使用编译器能识别的定长循环，方便开启 SIMD 优化
-        #pragma GCC ivdep
+        bool has_clipped = false;
         for (int i = 0; i < 5; ++i) {
-            double a = std::abs(s[i]);
-            if (a > s_peak[i]) s_peak[i] = a;
-            if (a > max_stress_period) max_stress_period = a;
+            double abs_s = std::abs(s[i]);
+            if (abs_s > s_peak[i]) s_peak[i] = abs_s;
+            if (abs_s > max_stress_period) max_stress_period = abs_s;
             
-            if (a >= LIMIT) {
-                s_clips[i]++;
+            if (abs_s >= LIMIT) {
                 s[i] = (s[i] > 0) ? LIMIT : -LIMIT;
-                clipped = true;
+                has_clipped = true;
             }
         }
+        if (has_clipped) total_clips++;
         
-        if (clipped) total_clips++;
-        
-        // 量化器
-        q = (s[4] >= 0) ? 1.0 : -1.0;
-        return (q > 0) ? 1 : 0;
+        int bit = (s[4] >= 0) ? 1 : 0;
+        q = bit ? 1.0 : -1.0;
+        return bit;
     }
 };
 
-// UI 渲染函数 - 减少终端刷新带来的系统调用负担
-std::string draw_auto_bar(std::string lab, double val, double &scale, std::string color, int width = 30) {
-    if (val > scale) scale = val * 1.05;
-    else if (scale > 100.0) scale *= 0.992; 
-    if (scale < 100.0) scale = 100.0;
-
-    float pct = (float)std::min(1.0, val / scale);
-    int filled = static_cast<int>(pct * width);
+// 🎨 渲染工具
+std::string make_bar(std::string lab, double val, double max_v, std::string color, int width = 30) {
+    int filled = static_cast<int>((std::min(val, max_v) / max_v) * width);
     std::string res = lab + " [" + color;
-    for (int i = 0; i < width; ++i) {
-        if (i < filled) res += "#";
-        else if (i == filled) res += ">";
-        else res += "-";
-    }
+    for (int i = 0; i < width; ++i) res += (i < filled) ? "#" : "-";
     res += "\033[0m] ";
-    
-    char info[64];
-    snprintf(info, sizeof(info), "%4d/%-4d", (int)val, (int)scale);
-    return res + info;
+    return res;
 }
 
 int main(int argc, char* argv[]) {
-    double target_gain = (argc > 1) ? std::atof(argv[1]) : 0.8;
+    double target_gain = (argc > 1) ? std::atof(argv[1]) : 0.5;
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(NULL);
+
     SDM5 mod_l, mod_r;
     mod_l.gain_factor = mod_r.gain_factor = target_gain;
 
     float cur[2], nxt[2];
+    uint8_t out_l[8], out_r[8];
     uint64_t total_frames = 0;
-    double p_l = 0, p_r = 0, pcm_scale = 60.0;
+    float peak_l = 0, peak_r = 0;
 
-    // 预分配 buffer 提高写入效率
-    std::vector<char> write_buf(16);
-
+    if (!std::cin.read(reinterpret_cast<char*>(cur), 8)) return 0;
     std::cerr << "\033[2J\033[H\033[?25l"; 
 
-    while (std::cin.read(reinterpret_cast<char*>(cur), 8)) {
-        if (!std::cin.read(reinterpret_cast<char*>(nxt), 8)) break;
-        
-        p_l = std::max(p_l, (double)std::abs(cur[0]));
-        p_r = std::max(p_r, (double)std::abs(cur[1]));
+    while (std::cin.read(reinterpret_cast<char*>(nxt), 8)) {
+        peak_l = std::max(peak_l, std::abs(cur[0]));
+        peak_r = std::max(peak_r, std::abs(cur[1]));
 
-        uint8_t out[16]; 
-        // DSD512 插值算法优化：针对 Pi 5 的单指令流多数据友好排布
         for (int i = 0; i < 8; ++i) {
             uint8_t bl = 0, br = 0;
             for (int bit = 7; bit >= 0; --bit) {
                 float alpha = static_cast<float>(i * 8 + (7 - bit)) / 64.0f;
-                if (mod_l.modulate(cur[0] * (1.0f - alpha) + nxt[0] * alpha)) bl |= (1 << bit);
-                if (mod_r.modulate(cur[1] * (1.0f - alpha) + nxt[1] * alpha)) br |= (1 << bit);
+                if (mod_l.modulate(cur[0]*(1.0f-alpha) + nxt[0]*alpha)) bl |= (1 << bit);
+                if (mod_r.modulate(cur[1]*(1.0f-alpha) + nxt[1]*alpha)) br |= (1 << bit);
             }
-            out[i] = bl; out[i + 8] = br;
+            out_l[i] = bl; out_r[i] = br;
         }
 
-        if (!isatty(STDOUT_FILENO)) {
-            // Pi 5 的 I/O 缓冲区交替写入，保证 DSD 声道对齐
-            std::cout.write(reinterpret_cast<char*>(&out[0]), 4); 
-            std::cout.write(reinterpret_cast<char*>(&out[8]), 4);
-            std::cout.write(reinterpret_cast<char*>(&out[4]), 4); 
-            std::cout.write(reinterpret_cast<char*>(&out[12]), 4);
-        }
+        // 📤 输出 DSD512 数据块
+        std::cout.write(reinterpret_cast<char*>(&out_l[0]), 4);
+        std::cout.write(reinterpret_cast<char*>(&out_r[0]), 4);
+        std::cout.write(reinterpret_cast<char*>(&out_l[4]), 4);
+        std::cout.write(reinterpret_cast<char*>(&out_r[4]), 4);
 
-        // 刷新频率锁定在 0.5 秒，避免终端 I/O 抢占 CPU 时间
-        if (++total_frames % 176400 == 0) {
-            std::cerr << "\033[H\033[1;32m>>> PI-5 DSD512 OPTIMIZED | ADAPTIVE ANALYZER | GAIN: " << target_gain << " <<<\033[0m\n\n";
+        cur[0] = nxt[0]; cur[1] = nxt[1];
+        total_frames++;
 
-            auto render_ch = [&](std::string name, double pk, SDM5& m) {
+        // ⏱️ 1秒渲染4次 (44100 / 4 ≈ 11025)
+        if (total_frames % 11025 == 0) {
+            std::cerr << "\033[H\033[1;36m--- LUMEN DSD512 ENGINE | GAIN: " << target_gain << " ---\033[0m\n\n";
+
+            auto render_ch = [&](std::string name, float pk, SDM5& m) {
                 double db = (pk < 1e-7) ? -60.0 : 20.0 * std::log10(pk);
-                double total_clip_pct = (m.total_samples > 0) ? (double)m.total_clips / m.total_samples * 100.0 : 0.0;
+                double clip_rate = (double)m.total_clips / m.total_samples * 100.0;
 
-                std::cerr << "\033[1;37m[" << name << " CHANNEL]\033[0m\n";
-                std::cerr << draw_auto_bar("  PCM   ", db + 60.0, pcm_scale, "\033[1;32m") << " dB\n";
-                std::cerr << draw_auto_bar("  STRESS", m.max_stress_period, m.global_stress_scale, "\033[1;31m") 
-                          << " (" << std::fixed << std::setprecision(2) << total_clip_pct << "% CLIP)\n";
+                std::cerr << "\033[1;37m" << name << "\033[0m\n";
+                std::cerr << make_bar("  PCM   ", db + 60.0, 60.0, "\033[1;32m") << (int)db << " dB\n";
+                std::cerr << make_bar("  STRESS", m.max_stress_period, 120.0, "\033[1;31m") << std::fixed << std::setprecision(3) << clip_rate << "% CLIP\n";
                 
-                for(int i = 0; i < 5; ++i) {
-                    float s_clip_pct = (m.total_samples > 0) ? (float)m.s_clips[i] / m.total_samples * 100.0f : 0.0f;
-                    std::string s_col = (s_clip_pct > 1.0) ? "\033[1;31m" : (s_clip_pct > 0.01 ? "\033[1;33m" : "\033[1;34m");
-                    std::cerr << draw_auto_bar("  Stage " + std::to_string(i), m.s_peak[i], m.s_scale[i], s_col, 22);
-                    std::cerr << " \033[0;30m(" << std::fixed << std::setprecision(2) << s_clip_pct << "%)\033[0m\n";
+                std::cerr << "  LEVELS ";
+                for(int i=0; i<5; ++i) {
+                    std::string s_color = (m.s_peak[i] > 90) ? "\033[1;33m" : "\033[1;34m";
+                    std::cerr << "S" << i << ":" << s_color << std::setw(3) << (int)m.s_peak[i] << " \033[0m";
+                    m.s_peak[i] *= 0.5; // 留一点残影效果
                 }
-                std::cerr << "\n";
-                
-                for(int i = 0; i < 5; ++i) { m.s_peak[i] = 0; m.s_clips[i] = 0; }
+                std::cerr << "\n\n";
                 m.total_samples = 0; m.total_clips = 0; m.max_stress_period = 0;
             };
 
-            render_ch("LEFT", p_l, mod_l);
-            render_ch("RIGHT", p_r, mod_r);
+            render_ch("LEFT CHANNEL", peak_l, mod_l);
+            render_ch("RIGHT CHANNEL", peak_r, mod_r);
+            peak_l = 0; peak_r = 0;
             std::cerr << std::flush;
         }
     }
-    std::cerr << "\033[?25h";
     return 0;
 }
