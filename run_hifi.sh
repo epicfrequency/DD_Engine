@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 参数设置
-USER_GAIN=${1:-0.50}
+USER_GAIN=${1:-0.2}
 PIPE_PATH="/tmp/mpd_dsd_pipe"
 ENGINE_BIN="./lumen_dsd_engine"
 SOURCE_CODE="lumen_dsd_engine.cpp"
