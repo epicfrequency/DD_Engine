@@ -8,7 +8,7 @@
 struct alignas(64) SDM5 {
     double s[5] = {0,0,0,0,0};
     double q = 0;
-    const double LIMIT = 300.0;
+    const double LIMIT = 128.0;
     double gain_factor = 0.5;
 
     // 极致监控：仅保留核心计数和瞬时采样
