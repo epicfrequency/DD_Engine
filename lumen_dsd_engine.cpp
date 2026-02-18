@@ -3,107 +3,83 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
-#include <iomanip>
 
+// 强制 64 字节对齐，防止伪共享（False Sharing）并优化缓存行读取
 struct alignas(64) SDM5 {
-    double s[5] = {0,0,0,0,0};
-    double q = 0;
-    const double LIMIT = 128.0;
-    double gain_factor = 0.5;
+    float s[5] = {0,0,0,0,0};
+    float q = 0.0f;
+    const float LIMIT = 128.0f;
+    float gain_factor;
 
-    // 极致监控：仅保留核心计数和瞬时采样
-    uint64_t s4_clip_hits = 0; 
-    double current_s4 = 0;
-    double pcm_sample = 0;
+    // 究极优化：移除所有计数器和监控变量，只留纯数学运算
+    inline int modulate(float input) {
+        const float x = input * gain_factor;
 
-    inline int modulate(double input) {
-        const double x = input * gain_factor;
-
-        // 1. 核心调制逻辑
+        // 五阶反馈回路：保持你调教好的原始系数
         s[0] += (x - q);
-        s[1] += (s[0] - q * 0.5);
-        s[2] += (s[1] - q * 0.25);
-        s[3] += (s[2] - q * 0.125);
-        s[4] += (s[3] - q * 0.0625); // 试试看S4反馈增强一点
+        s[1] += (s[0] - q * 0.5f);
+        s[2] += (s[1] - q * 0.25f);
+        s[3] += (s[2] - q * 0.125f);
+        s[4] += (s[3] - q * 0.0625f);
 
-        // 2. 前四阶仅做 Clamp
-        for (int i = 0; i < 4; ++i) {
-            if (s[i] > LIMIT) s[i] = LIMIT;
-            else if (s[i] < -LIMIT) s[i] = -LIMIT;
-        }
+        // 极限 Clamp 优化：编译器会将其转化为无分支的 fminnm/fmaxnm 指令
+        if (s[0] >  LIMIT) s[0] =  LIMIT; else if (s[0] < -LIMIT) s[0] = -LIMIT;
+        if (s[1] >  LIMIT) s[1] =  LIMIT; else if (s[1] < -LIMIT) s[1] = -LIMIT;
+        if (s[2] >  LIMIT) s[2] =  LIMIT; else if (s[2] < -LIMIT) s[2] = -LIMIT;
+        if (s[3] >  LIMIT) s[3] =  LIMIT; else if (s[3] < -LIMIT) s[3] = -LIMIT;
+        if (s[4] >  LIMIT) s[4] =  LIMIT; else if (s[4] < -LIMIT) s[4] = -LIMIT;
 
-        // 3. 仅对 S4 进行截断计数
-        if (s[4] > LIMIT) { s[4] = LIMIT; s4_clip_hits++; }
-        else if (s[4] < -LIMIT) { s[4] = -LIMIT; s4_clip_hits++; }
-
-        // 采样瞬时值
-        current_s4 = s[4];
-        pcm_sample = x;
-
-        int bit = (s[4] >= 0) ? 1 : 0;
-        q = bit ? 1.0 : -1.0;
+        const int bit = (s[4] >= 0.0f);
+        q = bit ? 1.0f : -1.0f;
         return bit;
-    }
-
-    void reset_metrics() {
-        s4_clip_hits = 0;
     }
 };
 
 int main(int argc, char* argv[]) {
-    double target_gain = (argc > 1) ? std::atof(argv[1]) : 0.5;
+    const float target_gain = (argc > 1) ? std::static_cast<float>(std::atof(argv[1])) : 0.5f;
+
+    // 极致 IO 提速
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(NULL);
+    std::cout.tie(NULL);
 
     SDM5 mod_l, mod_r;
     mod_l.gain_factor = mod_r.gain_factor = target_gain;
 
     float cur[2], nxt[2];
-    uint8_t out_l[8], out_r[8];
-    uint64_t frame_count = 0;
+    const float inv_64 = 1.0f / 64.0f;
 
     if (!std::cin.read(reinterpret_cast<char*>(cur), 8)) return 0;
-    std::cerr << "\033[2J\033[H\033[?25l";
+
+    // 预分配内存，避免任何运行时堆分配
+    uint32_t out_block[4]; // [L_high, R_high, L_low, R_low]
 
     while (std::cin.read(reinterpret_cast<char*>(nxt), 8)) {
-        for (int i = 0; i < 8; ++i) {
-            uint8_t bl = 0, br = 0;
-            for (int bit = 7; bit >= 0; --bit) {
-                float alpha = static_cast<float>(i * 8 + (7 - bit)) / 64.0f;
-                if (mod_l.modulate(cur[0]*(1.0-alpha) + nxt[0]*alpha)) bl |= (1 << bit);
-                if (mod_r.modulate(cur[1]*(1.0-alpha) + nxt[1]*alpha)) br |= (1 << bit);
+        const float diff_l = nxt[0] - cur[0];
+        const float diff_r = nxt[1] - cur[1];
+
+        // 展开插值循环，每 32 个采样构造一个 U32
+        for (int half = 0; half < 2; ++half) {
+            uint32_t ul = 0, ur = 0;
+            const int offset = half * 32;
+
+            for (int b = 0; b < 32; ++b) {
+                const float alpha = static_cast<float>(offset + b) * inv_64;
+                // 构造大端序：从最高位(bit 31)开始填入
+                if (mod_l.modulate(cur[0] + diff_l * alpha)) ul |= (1U << (31 - b));
+                if (mod_r.modulate(cur[1] + diff_r * alpha)) ur |= (1U << (31 - b));
             }
-            out_l[i] = bl; out_r[i] = br;
+
+            // Pi 5 是小端序，我们需要手动构造大端字节流
+            // __builtin_bswap32 将 native (LE) 转为 BE
+            out_block[half * 2]     = __builtin_bswap32(ul);
+            out_block[half * 2 + 1] = __builtin_bswap32(ur);
         }
 
-        std::cout.write(reinterpret_cast<char*>(&out_l[0]), 4);
-        std::cout.write(reinterpret_cast<char*>(&out_r[0]), 4);
-        std::cout.write(reinterpret_cast<char*>(&out_l[4]), 4);
-        std::cout.write(reinterpret_cast<char*>(&out_r[4]), 4);
+        std::cout.write(reinterpret_cast<char*>(out_block), 16);
 
-        cur[0] = nxt[0]; cur[1] = nxt[1];
-        frame_count++;
-
-        // 利用 frame_count 推算百分比，每 0.1 秒刷新一次
-        if (frame_count % 38400 == 0) {
-            std::cerr << "\033[H"; 
-            auto render = [&](const char* name, SDM5& m) {
-                double db = 20.0 * std::log10(std::abs(m.pcm_sample) + 1e-9);
-                // 直接用 38400 帧 * 64 倍插值得到该时段总样本数
-                double pct = (double)m.s4_clip_hits / (38400.0 * 64.0) * 100.0;
-                
-                std::cerr << name << " | PCM: " << std::fixed << std::setprecision(1) << std::setw(5) << db << " dB"
-                          << " | S4: " << std::setw(4) << (int)m.current_s4
-                          << " | CLIP(S4): " << std::setw(6) << m.s4_clip_hits 
-                          << " (" << std::setprecision(3) << pct << "%)\n";
-                m.reset_metrics();
-            };
-            std::cerr << "--- DSD512 MINIMAL MONITOR ---\n";
-            render("L", mod_l);
-            render("R", mod_r);
-            std::cerr << std::flush;
-        }
+        cur[0] = nxt[0];
+        cur[1] = nxt[1];
     }
-    std::cerr << "\033[?25h";
     return 0;
 }
