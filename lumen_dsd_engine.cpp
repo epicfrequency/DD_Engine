@@ -8,7 +8,7 @@
 struct alignas(64) SDM5 {
     double s[5] = {0,0,0,0,0};
     double q = 0;
-    const double LIMIT = 100.0;
+    const double LIMIT = 300.0;
     double gain_factor = 0.5;
 
     // 极致监控：仅保留核心计数和瞬时采样
@@ -24,7 +24,7 @@ struct alignas(64) SDM5 {
         s[1] += (s[0] - q * 0.5);
         s[2] += (s[1] - q * 0.25);
         s[3] += (s[2] - q * 0.125);
-        s[4] += (s[3] - q * 0.0625*2); // 试试看S4反馈增强一点
+        s[4] += (s[3] - q * 0.0625); // 试试看S4反馈增强一点
 
         // 2. 前四阶仅做 Clamp
         for (int i = 0; i < 4; ++i) {
