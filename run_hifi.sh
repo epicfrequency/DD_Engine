@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 参数设置
-USER_GAIN=${1:-0.5}
+USER_GAIN=${1:-0.2} # 默认增益设置为 0.2，用户可通过命令行参数覆盖
 PIPE_PATH="/tmp/mpd_dsd_pipe"
 ENGINE_BIN="./lumen_dsd_engine"
 SOURCE_CODE="lumen_dsd_engine.cpp"
