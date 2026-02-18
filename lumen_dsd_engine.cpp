@@ -1,87 +1,3 @@
-// #include <iostream>
-// #include <vector>
-// #include <cstdint>
-// #include <cmath>
-// #include <algorithm>
-
-// // 保持 64 字节对齐，防止多线程下的缓存行失效（虽然是单线程，但这是好习惯）
-// struct alignas(64) SDM5 {
-//     double s[5] = {0,0,0,0,0};
-//     double q = 0;
-//     const double LIMIT = 100.0;
-//     double gain_factor = 0.5;
-
-//     // 极致优化：去掉所有监控计数、Peak 记录和 Reset 逻辑
-//     inline int modulate(double input) {
-//         const double x = input * gain_factor;
-        
-//         // --- 核心音频链路逻辑：绝对不动 ---
-//         s[0] += (x - q);
-//         s[1] += (s[0] - q * 0.5);
-//         s[2] += (s[1] - q * 0.25);
-//         s[3] += (s[2] - q * 0.125);
-//         s[4] += (s[3] - q * 0.0625);
-
-//         // 仅保留必要的 Hard Clip 保护，防止数值飞出 double 范围
-//         for (int i = 0; i < 5; ++i) {
-//             if (s[i] > LIMIT) s[i] = LIMIT;
-//             else if (s[i] < -LIMIT) s[i] = -LIMIT;
-//         }
-
-//         int bit = (s[4] >= 0) ? 1 : 0;
-//         q = bit ? 1.0 : -1.0;
-//         return bit;
-//     }
-// };
-
-// int main(int argc, char* argv[]) {
-//     double target_gain = (argc > 1) ? std::atof(argv[1]) : 0.5;
-
-//     // 提升 IO 效率
-//     std::ios_base::sync_with_stdio(false);
-//     std::cin.tie(NULL);
-
-//     SDM5 mod_l, mod_r;
-//     mod_l.gain_factor = mod_r.gain_factor = target_gain;
-
-//     float cur[2], nxt[2];
-//     uint8_t out_l[8], out_r[8];
-
-//     // 预读取第一帧
-//     if (!std::cin.read(reinterpret_cast<char*>(cur), 8)) return 0;
-
-//     // 彻底移除 stderr 的实时 UI 渲染，只跑音频逻辑
-//     while (std::cin.read(reinterpret_cast<char*>(nxt), 8)) {
-        
-//         // DSD512 64倍插值处理
-//         for (int i = 0; i < 8; ++i) {
-//             uint8_t bl = 0, br = 0;
-//             for (int bit = 7; bit >= 0; --bit) {
-//                 // 线性插值
-//                 float alpha = static_cast<float>(i * 8 + (7 - bit)) / 64.0f;
-//                 double pl = (double)cur[0] * (1.0f - alpha) + (double)nxt[0] * alpha;
-//                 double pr = (double)cur[1] * (1.0f - alpha) + (double)nxt[1] * alpha;
-                
-//                 if (mod_l.modulate(pl)) bl |= (1 << bit);
-//                 if (mod_r.modulate(pr)) br |= (1 << bit);
-//             }
-//             out_l[i] = bl; out_r[i] = br;
-//         }
-
-//         // 紧凑的输出逻辑：对齐 DSD512 的双声道交织格式
-//         std::cout.write(reinterpret_cast<char*>(&out_l[0]), 4);
-//         std::cout.write(reinterpret_cast<char*>(&out_r[0]), 4);
-//         std::cout.write(reinterpret_cast<char*>(&out_l[4]), 4);
-//         std::cout.write(reinterpret_cast<char*>(&out_r[4]), 4);
-
-//         cur[0] = nxt[0]; cur[1] = nxt[1];
-//     }
-//     return 0;
-// }
-
-
-
-
 #include <iostream>
 #include <vector>
 #include <cstdint>
@@ -89,41 +5,44 @@
 #include <algorithm>
 #include <iomanip>
 
+// 保持 64 字节对齐，优化缓存行利用率 ⚡
 struct alignas(64) SDM5 {
     double s[5] = {0,0,0,0,0};
     double q = 0;
     const double LIMIT = 100.0;
     double gain_factor = 0.5;
 
-    // 监控变量（仅在核心循环中做最简操作）
-    uint64_t clip_total = 0;
-    uint64_t sample_total = 0;
-    double pcm_peak = 0;
-    double s4_max = 0;
+    // 极致监控变量：只存储原始数据
+    uint64_t total_samples = 0;
+    uint64_t s4_clip_hits = 0; 
+    double current_s4 = 0;
+    double pcm_sample = 0;
 
     inline int modulate(double input) {
         const double x = input * gain_factor;
-        sample_total++;
+        total_samples++;
 
-        // 核心算法
+        // 1. 核心五阶调制算法 (纯算术)
         s[0] += (x - q);
         s[1] += (s[0] - q * 0.5);
         s[2] += (s[1] - q * 0.25);
         s[3] += (s[2] - q * 0.125);
         s[4] += (s[3] - q * 0.0625);
 
-        // 记录 PCM 峰值
-        double abs_x = (x < 0) ? -x : x;
-        if (abs_x > pcm_peak) pcm_peak = abs_x;
-
-        // Clip 检查与记录
-        double abs_s4 = (s[4] < 0) ? -s[4] : s[4];
-        if (abs_s4 > s4_max) s4_max = abs_s4;
-        
-        for (int i = 0; i < 5; ++i) {
-            if (s[i] > LIMIT) { s[i] = LIMIT; clip_total++; }
-            else if (s[i] < -LIMIT) { s[i] = -LIMIT; clip_total++; }
+        // 2. 极致简化的 Clamp 逻辑
+        // 前四阶只 Clamp 不计数
+        for (int i = 0; i < 4; ++i) {
+            if (s[i] > LIMIT) s[i] = LIMIT;
+            else if (s[i] < -LIMIT) s[i] = -LIMIT;
         }
+
+        // 仅对最后一阶 S4 进行截断统计 🎯
+        if (s[4] > LIMIT) { s[4] = LIMIT; s4_clip_hits++; }
+        else if (s[4] < -LIMIT) { s[4] = -LIMIT; s4_clip_hits++; }
+
+        // 3. 记录瞬时值用于异步显示
+        current_s4 = s[4];
+        pcm_sample = x;
 
         int bit = (s[4] >= 0) ? 1 : 0;
         q = bit ? 1.0 : -1.0;
@@ -131,15 +50,15 @@ struct alignas(64) SDM5 {
     }
 
     void reset_metrics() {
-        clip_total = 0;
-        sample_total = 0;
-        pcm_peak = 0;
-        s4_max = 0;
+        s4_clip_hits = 0;
+        total_samples = 0;
     }
 };
 
 int main(int argc, char* argv[]) {
     double target_gain = (argc > 1) ? std::atof(argv[1]) : 0.5;
+
+    // 提升 IO 吞吐量
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(NULL);
 
@@ -152,7 +71,7 @@ int main(int argc, char* argv[]) {
 
     if (!std::cin.read(reinterpret_cast<char*>(cur), 8)) return 0;
 
-    // 预清屏
+    // 清屏并隐藏光标
     std::cerr << "\033[2J\033[H\033[?25l";
 
     while (std::cin.read(reinterpret_cast<char*>(nxt), 8)) {
@@ -160,12 +79,14 @@ int main(int argc, char* argv[]) {
             uint8_t bl = 0, br = 0;
             for (int bit = 7; bit >= 0; --bit) {
                 float alpha = static_cast<float>(i * 8 + (7 - bit)) / 64.0f;
+                // 线性插值并调制
                 if (mod_l.modulate(cur[0]*(1.0-alpha) + nxt[0]*alpha)) bl |= (1 << bit);
-                if (mod_r.modulate(br = mod_r.modulate(cur[1]*(1.0-alpha) + nxt[1]*alpha))) br |= (1 << bit);
+                if (mod_r.modulate(cur[1]*(1.0-alpha) + nxt[1]*alpha)) br |= (1 << bit);
             }
             out_l[i] = bl; out_r[i] = br;
         }
 
+        // 高效二进制输出
         std::cout.write(reinterpret_cast<char*>(&out_l[0]), 4);
         std::cout.write(reinterpret_cast<char*>(&out_r[0]), 4);
         std::cout.write(reinterpret_cast<char*>(&out_l[4]), 4);
@@ -174,24 +95,28 @@ int main(int argc, char* argv[]) {
         cur[0] = nxt[0]; cur[1] = nxt[1];
         frame_count++;
 
-        // 每秒更新10次 (约 38400 帧更新一次)
+        // 异步 UI 刷新：每秒约 10 次 (384000 / 10 = 38400)
         if (frame_count % 38400 == 0) {
-            auto print_stat = [&](const char* label, SDM5& m) {
-                double db = 20.0 * std::log10(m.pcm_peak + 1e-9);
-                double clip_pct = (m.sample_total > 0) ? (double)m.clip_total / (m.sample_total * 5) * 100.0 : 0;
-                std::cerr << label << " | PCM: " << std::fixed << std::setprecision(1) << std::setw(5) << db << " dB"
-                          << " | S4: " << std::setw(5) << (int)m.s4_max 
-                          << " | CLIP: " << std::setw(6) << m.clip_total 
-                          << " (" << clip_pct << "%)\n";
+            std::cerr << "\033[H"; // 光标回顶部
+            auto render = [&](const char* name, SDM5& m) {
+                // 仅在显示时才进行复杂的对数计算 📉
+                double db = 20.0 * std::log10(std::abs(m.pcm_sample) + 1e-9);
+                double pct = (m.total_samples > 0) ? (double)m.s4_clip_hits / m.total_samples * 100.0 : 0.0;
+                
+                std::cerr << name << " | PCM: " << std::fixed << std::setprecision(1) << std::setw(5) << db << " dB"
+                          << " | S4: " << std::setw(4) << (int)m.current_s4
+                          << " | CLIP(S4): " << std::setw(6) << m.s4_clip_hits 
+                          << " (" << pct << "%)\n";
                 m.reset_metrics();
             };
 
-            std::cerr << "\033[H"; // 光标回到左上角
-            std::cerr << "--- DSD512 MONITOR (10Hz) ---\n";
-            print_stat("LEFT ", mod_l);
-            print_stat("RIGHT", mod_r);
+            std::cerr << "\033[1;36m>>> DSD512 ULTIMATE ENGINE | GAIN: " << target_gain << " <<<\033[0m\n";
+            render("L", mod_l);
+            render("R", mod_r);
             std::cerr << std::flush;
         }
     }
+    
+    std::cerr << "\033[?25h"; // 恢复光标
     return 0;
 }
