@@ -6,28 +6,25 @@
 #include <cstdlib>
 #include <cstdio>
 #include <thread>
-#include <vector>
-#include <mutex>
-#include <condition_variable>
-#include <queue>
 #include <atomic>
+#include <vector>
 #include <cstring>
+#include <chrono>
 
-// 核心绑定需要的头文件
 #ifdef __linux__
   #include <sched.h>
   #include <pthread.h>
 #endif
 
-// 字节序转换
+// 字节序转换（ALSA DSD_U32_BE 必须）
 static inline uint32_t bswap32(uint32_t x) noexcept { return __builtin_bswap32(x); }
 
-// NEON 检测与定义
+// ===================== 统一的 SDM 引擎 (NEON vs Scalar) =====================
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
   #include <arm_neon.h>
-  struct alignas(64) SDM5_neon2 {
+  struct alignas(64) SDM5_Engine {
     float32x2_t s0, s1, s2, s3, s4, q, gain, vLimit, vNegLimit;
-    SDM5_neon2(float g) noexcept {
+    SDM5_Engine(float g) noexcept {
         s0 = s1 = s2 = s3 = s4 = vdup_n_f32(0.0f);
         q = vdup_n_f32(0.0f); gain = vdup_n_f32(g);
         vLimit = vdup_n_f32(128.0f); vNegLimit = vdup_n_f32(-128.0f);
@@ -50,34 +47,38 @@ static inline uint32_t bswap32(uint32_t x) noexcept { return __builtin_bswap32(x
     }
   };
 #else
-  // 回退到标量模式以防在非 NEON 环境测试
-  struct SDM5_scalar {
-      float s[5]={0}, q=0, gain;
-      SDM5_scalar(float g) : gain(g) {}
-      inline int modulate(float in) {
-          float x = in * gain;
-          s[0]+=(x-q); s[1]+=(s[0]-q*0.5f); s[2]+=(s[1]-q*0.25f);
-          s[3]+=(s[2]-q*0.125f); s[4]+=(s[3]-q*0.0625f);
-          for(int j=0; j<5; ++j) { if(s[j]>128.f) s[j]=128.f; else if(s[j]<-128.f) s[j]=-128.f; }
-          int b=(s[4]>=0); q=b?1.f:-1.f; return b;
+  // 非 NEON 环境的 Fallback (用于编译通过)
+  struct SDM5_Engine {
+      float sL[5]={0}, sR[5]={0}, qL=0, qR=0, gain;
+      SDM5_Engine(float g) : gain(g) {}
+      inline uint32_t modulate2(struct {float l, r;} in) {
+          auto step = [&](float i, float* s, float& q) {
+              float x = i * gain;
+              s[0]+=(x-q); s[1]+=(s[0]-q*0.5f); s[2]+=(s[1]-q*0.25f);
+              s[3]+=(s[2]-q*0.125f); s[4]+=(s[3]-q*0.0625f);
+              for(int j=0; j<5; ++j) { if(s[j]>128.f) s[j]=128.f; else if(s[j]<-128.f) s[j]=-128.f; }
+              int b=(s[4]>=0); q=b?1.f:-1.f; return (uint32_t)b;
+          };
+          return step(in.l, sL, qL) | (step(in.r, sR, qR) << 1);
       }
   };
 #endif
 
-// 并行参数
-constexpr int BATCH = 1024;
+// ===================== 并行同步逻辑 =====================
+constexpr int BATCH = 8192;   
+constexpr int QUEUE_SIZE = 8; 
+
 struct Payload {
     float in_data[BATCH][2];
     uint32_t out_data[BATCH][4];
-    size_t n;
+    size_t n = 0;
+    std::atomic<bool> ready{false}; 
 };
 
-// 线程间同步
-std::queue<Payload*> work_queue;
-std::queue<Payload*> free_queue;
-std::mutex mtx_work, mtx_free, mtx_stdout;
-std::condition_variable cv_work;
-std::atomic<bool> done{false};
+Payload pool[QUEUE_SIZE];
+std::atomic<size_t> producer_idx{0};
+std::atomic<size_t> consumer_idx{0};
+std::atomic<bool> stop_flag{false};
 
 void worker_func(int core_id, float gain) {
 #ifdef __linux__
@@ -87,98 +88,87 @@ void worker_func(int core_id, float gain) {
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 #endif
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    SDM5_neon2 mod(gain);
-#else
-    SDM5_scalar modL(gain), modR(gain);
-#endif
-
+    SDM5_Engine mod(gain);
     float curL = 0, curR = 0;
-    while (true) {
-        Payload* p = nullptr;
-        {
-            std::unique_lock<std::mutex> lock(mtx_work);
-            cv_work.wait(lock, [] { return !work_queue.empty() || done; });
-            if (work_queue.empty() && done) break;
-            p = work_queue.front();
-            work_queue.pop();
-        }
 
-        for (size_t i = 0; i < p->n; ++i) {
-            float nxtL = p->in_data[i][0], nxtR = p->in_data[i][1];
-            float stepL = (nxtL - curL) * (1.0f/64.0f), stepR = (nxtR - curR) * (1.0f/64.0f);
-            uint32_t L0=0, R0=0, L1=0, R1=0;
+    while (!stop_flag) {
+        size_t c_idx = consumer_idx.load(std::memory_order_acquire);
+        Payload& p = pool[c_idx % QUEUE_SIZE];
+
+        // 检查是否有新数据块进入队列且尚未处理
+        if (p.n > 0 && !p.ready.load(std::memory_order_relaxed)) {
+            for (size_t i = 0; i < p.n; ++i) {
+                float nxtL = p.in_data[i][0], nxtR = p.in_data[i][1];
+                float stepL = (nxtL - curL) * (1.0f/64.0f), stepR = (nxtR - curR) * (1.0f/64.0f);
+                uint32_t L0=0, R0=0, L1=0, R1=0;
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-            float32x2_t v = {curL, curR}, step = {stepL, stepR};
-            for(int b=0; b<32; ++b) { 
-                uint32_t bits = mod.modulate2(v);
-                L0 = (L0<<1)|(bits&1u); R0 = (R0<<1)|((bits>>1)&1u); v = vadd_f32(v, step);
-            }
-            for(int b=0; b<32; ++b) {
-                uint32_t bits = mod.modulate2(v);
-                L1 = (L1<<1)|(bits&1u); R1 = (R1<<1)|((bits>>1)&1u); v = vadd_f32(v, step);
-            }
+                float32x2_t v = {curL, curR}, v_step = {stepL, stepR};
+                for(int b=0; b<32; ++b) { 
+                    uint32_t bits = mod.modulate2(v);
+                    L0 = (L0<<1)|(bits&1u); R0 = (R0<<1)|((bits>>1)&1u); v = vadd_f32(v, v_step);
+                }
+                for(int b=0; b<32; ++b) {
+                    uint32_t bits = mod.modulate2(v);
+                    L1 = (L1<<1)|(bits&1u); R1 = (R1<<1)|((bits>>1)&1u); v = vadd_f32(v, v_step);
+                }
 #else
-            float vL = curL, vR = curR;
-            for(int b=0; b<32; ++b) {
-                L0 = (L0<<1)|(uint32_t)modL.modulate(vL); R0 = (R0<<1)|(uint32_t)modR.modulate(vR);
-                vL += stepL; vR += stepR;
-            }
-            for(int b=0; b<32; ++b) {
-                L1 = (L1<<1)|(uint32_t)modL.modulate(vL); R1 = (R1<<1)|(uint32_t)modR.modulate(vR);
-                vL += stepL; vR += stepR;
-            }
+                struct {float l, r;} v = {curL, curR};
+                for(int b=0; b<32; ++b) {
+                    uint32_t bits = mod.modulate2({v.l, v.r});
+                    L0=(L0<<1)|(bits&1u); R0=(R0<<1)|((bits>>1)&1u); v.l+=stepL; v.r+=stepR;
+                }
+                for(int b=0; b<32; ++b) {
+                    uint32_t bits = mod.modulate2({v.l, v.r});
+                    L1=(L1<<1)|(bits&1u); R1=(R1<<1)|((bits>>1)&1u); v.l+=stepL; v.r+=stepR;
+                }
 #endif
-            p->out_data[i][0] = bswap32(L0); p->out_data[i][1] = bswap32(R0);
-            p->out_data[i][2] = bswap32(L1); p->out_data[i][3] = bswap32(R1);
-            curL = nxtL; curR = nxtR;
-        }
-
-        // 输出并回收缓冲区
-        {
-            std::lock_guard<std::mutex> lock(mtx_stdout);
-            std::fwrite(p->out_data, sizeof(uint32_t)*4, p->n, stdout);
-        }
-        {
-            std::lock_guard<std::mutex> lock(mtx_free);
-            free_queue.push(p);
+                p.out_data[i][0] = bswap32(L0); p.out_data[i][1] = bswap32(R0);
+                p.out_data[i][2] = bswap32(L1); p.out_data[i][3] = bswap32(R1);
+                curL = nxtL; curR = nxtR;
+            }
+            p.ready.store(true, std::memory_order_release);
+            consumer_idx.fetch_add(1, std::memory_order_release);
+        } else {
+            // 关键：避免 100% 占用的微睡眠
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
 }
 
 int main(int argc, char** argv) {
     float gain = (argc > 1) ? (float)std::atof(argv[1]) : 0.5f;
-    std::setvbuf(stdin,  nullptr, _IOFBF, 1<<20);
-    std::setvbuf(stdout, nullptr, _IOFBF, 1<<20);
+    std::setvbuf(stdin,  nullptr, _IOFBF, 2<<20);
+    std::setvbuf(stdout, nullptr, _IOFBF, 2<<20);
 
-    // 预分配缓冲区
-    for(int i=0; i<4; ++i) free_queue.push(new Payload());
+    std::thread worker(worker_func, 1, gain); // 绑定 Core 1
 
-    // 启动两个计算线程，绑定到核心 1 和 2
-    std::thread t1(worker_func, 1, gain);
-    std::thread t2(worker_func, 2, gain);
-
+    size_t write_idx = 0;
     while (true) {
-        Payload* p = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(mtx_free);
-            if (!free_queue.empty()) { p = free_queue.front(); free_queue.pop(); }
+        size_t p_idx = producer_idx.load(std::memory_order_acquire);
+        Payload& p = pool[p_idx % QUEUE_SIZE];
+
+        // 生产者：如果槽位空闲，读取数据
+        if (!p.ready.load(std::memory_order_relaxed)) {
+            p.n = std::fread(p.in_data, sizeof(float)*2, BATCH, stdin);
+            if (p.n == 0) break; 
+            producer_idx.fetch_add(1, std::memory_order_release);
         }
-        
-        if (!p) { std::this_thread::yield(); continue; }
 
-        p->n = std::fread(p->in_data, sizeof(float)*2, BATCH, stdin);
-        if (p->n == 0) { done = true; break; }
-
-        {
-            std::lock_guard<std::mutex> lock(mtx_work);
-            work_queue.push(p);
-            cv_work.notify_one();
+        // 消费者：检查是否有处理完的块并输出
+        Payload& out_p = pool[write_idx % QUEUE_SIZE];
+        if (out_p.ready.load(std::memory_order_acquire)) {
+            if (std::fwrite(out_p.out_data, sizeof(uint32_t)*4, out_p.n, stdout) != out_p.n) break;
+            out_p.n = 0; 
+            out_p.ready.store(false, std::memory_order_release);
+            write_idx++;
+        } else {
+            // 主线程也进行微睡眠
+            std::this_thread::sleep_for(std::chrono::microseconds(150));
         }
     }
 
-    cv_work.notify_all();
-    t1.join(); t2.join();
+    stop_flag = true;
+    worker.join();
     return 0;
 }
