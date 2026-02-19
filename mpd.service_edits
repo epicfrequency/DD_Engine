@@ -1,0 +1,19 @@
+  GNU nano 8.4                                     /etc/systemd/system/mpd.service.d/.#override.conf7a6d348915aa5efb                                               
+### Editing /etc/systemd/system/mpd.service.d/override.conf
+### Anything between here and the comment below will become the contents of the drop-in file
+
+[Service]
+# 强制 systemd 以 root 身份启动进程
+User=root
+Group=root
+
+# 配合你的 DSD512 链路，关闭路径隔离
+PrivateTmp=no
+ProtectSystem=no
+ProtectHome=no
+
+CPUAffinity=2
+# 提升实时音频优先级
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=99
+
